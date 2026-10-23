@@ -1,129 +1,253 @@
-import os, re, json, html, logging, asyncio
+# Self-bootstrap: install missing Python dependencies on first start when the host allows pip/network access.
+import importlib.util
+import subprocess
+import sys
+
+def _ensure_dependencies():
+    required = {
+        "requests": "requests>=2.32.3,<3",
+        "bs4": "beautifulsoup4>=4.12.3,<5",
+        "telegram": "python-telegram-bot==21.10",
+    }
+    missing = [package for module, package in required.items() if importlib.util.find_spec(module) is None]
+    if not missing:
+        return
+    print("[BloxPulse] Installing missing dependencies automatically:", ", ".join(missing), flush=True)
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", *missing])
+    except Exception as exc:
+        print("[BloxPulse] Automatic dependency installation failed.", flush=True)
+        print("[BloxPulse] Host must allow Python pip installs and outbound package downloads: " + str(exc), flush=True)
+        raise
+
+_ensure_dependencies()
+
+import os
+import re
+import json
+import html
+import logging
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ChatMemberHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ChatMemberHandler,
+    ContextTypes, filters,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-VALUE_URLS = [x.strip() for x in os.getenv("VALUE_URLS", os.getenv("VALUE_URL", "https://bloxfruitsvalues.net/values")).split(",") if x.strip()]
-STOCK_URLS = [x.strip() for x in os.getenv("STOCK_URLS", "https://blox-fruitswiki.com/wiki/stock/,https://blox-fruits-wiki.com/wiki/stock/").split(",") if x.strip()]
+ADMIN_IDS = {int(v.strip()) for v in os.getenv("ADMIN_IDS", "").split(",") if v.strip().isdigit()}
+VALUE_URLS = [v.strip() for v in os.getenv(
+    "VALUE_URLS", "https://bloxfruit.io/values/,https://bloxfruitsvalues.gg/values"
+).split(",") if v.strip()]
+STOCK_URLS = [v.strip() for v in os.getenv(
+    "STOCK_URLS", "https://blox-fruitswiki.com/wiki/stock/,https://bloxfruitswiki.org/wiki/stock/"
+).split(",") if v.strip()]
 CHECK_INTERVAL = max(300, int(os.getenv("CHECK_INTERVAL_SECONDS", "3600")))
 DB_PATH = Path(os.getenv("DB_PATH", "data.json"))
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("bloxpulse")
+
 DB = {"users": {}, "chats": {}, "values": {}, "stock": {}}
 session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36", "Accept-Language": "en-US,en;q=0.9"})
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
-FRUITS = ["Rocket", "Spin", "Chop", "Spring", "Bomb", "Smoke", "Spike", "Flame", "Falcon", "Eagle", "Ice", "Sand", "Dark", "Diamond", "Light", "Rubber", "Barrier", "Ghost", "Magma", "Quake", "Buddha", "Love", "Creation", "Spider", "Sound", "Phoenix", "Portal", "Rumble", "Pain", "Blizzard", "Gravity", "Mammoth", "T-Rex", "Dough", "Shadow", "Venom", "Control", "Spirit", "Dragon", "Leopard", "Kitsune", "Yeti", "Gas", "Tiger", "West Dragon", "East Dragon"]
+FRUITS = [
+    "Rocket", "Spin", "Blade", "Chop", "Spring", "Bomb", "Smoke", "Spike",
+    "Flame", "Falcon", "Eagle", "Ice", "Sand", "Dark", "Diamond", "Light",
+    "Rubber", "Barrier", "Ghost", "Magma", "Quake", "Buddha", "Love",
+    "Creation", "Spider", "Sound", "Phoenix", "Portal", "Rumble", "Lightning",
+    "Pain", "Blizzard", "Gravity", "Mammoth", "T-Rex", "Dough", "Shadow",
+    "Venom", "Control", "Spirit", "Dragon", "West Dragon", "East Dragon",
+    "Leopard", "Tiger", "Kitsune", "Yeti", "Gas", "Magnet",
+]
+FRUIT_LOOKUP = {x.lower(): x for x in FRUITS}
+FRUIT_LOOKUP["trex"] = "T-Rex"
+
 
 def now_text():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+
 def load_db():
+    """Load existing data without discarding older user records."""
     global DB
     try:
         if DB_PATH.exists():
-            data = json.loads(DB_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
+            loaded = json.loads(DB_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
                 for key in ("users", "chats", "values", "stock"):
-                    if isinstance(data.get(key), dict): DB[key] = data[key]
+                    if isinstance(loaded.get(key), dict):
+                        DB[key] = loaded[key]
     except Exception:
-        log.exception("Could not load data.json; using in-memory database")
+        log.exception("Failed to load data.json; in-memory fallback is active")
+
 
 def save_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = DB_PATH.with_suffix(DB_PATH.suffix + ".tmp")
-    tmp.write_text(json.dumps(DB, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(DB_PATH)
+    temp = DB_PATH.with_suffix(DB_PATH.suffix + ".tmp")
+    temp.write_text(json.dumps(DB, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(DB_PATH)
 
-def home_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("📦 استاک فعلی"), KeyboardButton("💎 ولیوها")],
-        [KeyboardButton("🔔 اعلان‌ها"), KeyboardButton("📱 ارسال شماره", request_contact=True)],
-        [KeyboardButton("ℹ️ راهنما")]
-    ], resize_keyboard=True)
 
-def user_record(user):
-    rec = DB.setdefault("users", {}).setdefault(str(user.id), {
-        "id": user.id, "username": user.username or "", "first_name": user.first_name or "",
-        "phone": "", "phone_verified": False, "created_at": now_text(), "alerts": True
-    })
-    rec.update({"id": user.id, "username": user.username or "", "first_name": user.first_name or ""})
-    return rec
+def norm(value):
+    return " ".join(str(value or "").replace("\xa0", " ").split())
 
-def get_soup(url, timeout=25):
-    response = session.get(url, timeout=timeout)
+
+def get_soup(url):
+    response = session.get(url, timeout=25)
     response.raise_for_status()
+    if not response.text.strip():
+        raise ValueError("منبع صفحه خالی برگرداند.")
     return BeautifulSoup(response.text, "html.parser")
 
-def norm(s):
-    return " ".join((s or "").replace("\\xa0", " ").split())
 
-def fruit_match(text):
+def home_keyboard(phone_saved=False):
+    rows = [
+        [KeyboardButton("📦 استاک فعلی"), KeyboardButton("💎 ولیوها")],
+        [KeyboardButton("🔔 اعلان‌ها"), KeyboardButton("ℹ️ راهنما")],
+    ]
+    if not phone_saved:
+        rows.insert(1, [KeyboardButton("📱 ثبت شماره", request_contact=True)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def user_record(user):
+    users = DB.setdefault("users", {})
+    key = str(user.id)
+    rec = users.setdefault(key, {
+        "id": user.id,
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "phone": "",
+        "phone_verified": False,
+        "created_at": now_text(),
+        "alerts": True,
+    })
+    # Keep phone/creation date/alert preference from existing record.
+    rec["id"] = user.id
+    rec["username"] = user.username or ""
+    rec["first_name"] = user.first_name or ""
+    rec.setdefault("phone", "")
+    rec.setdefault("phone_verified", False)
+    rec.setdefault("created_at", now_text())
+    rec.setdefault("alerts", True)
+    return rec
+
+
+def fruit_in(text):
     low = norm(text).lower()
-    for fruit in sorted(FRUITS, key=len, reverse=True):
-        if re.search(r"(?<![a-z])" + re.escape(fruit.lower()) + r"(?![a-z])", low):
-            return fruit
+    # Longest first to correctly match West/East Dragon.
+    for key in sorted(FRUIT_LOOKUP, key=len, reverse=True):
+        if re.search(r"(?<![a-z])" + re.escape(key) + r"(?![a-z])", low):
+            return FRUIT_LOOKUP[key]
     return None
 
-def section_fruits(soup, patterns):
+
+def parse_stock_section(soup, wanted):
     headings = soup.find_all(["h1", "h2", "h3", "h4"])
-    heading = next((h for h in headings if any(re.search(p, norm(h.get_text(" ", strip=True)).lower()) for p in patterns)), None)
-    if not heading:
+    heading = None
+    for item in headings:
+        title = norm(item.get_text(" ", strip=True)).lower()
+        if any(re.fullmatch(p, title) for p in wanted):
+            heading = item
+            break
+    if heading is None:
         return []
-    # Walk following siblings until the next stock heading; prevents mixing "Last Stock".
-    candidates = []
-    for sibling in heading.next_elements:
-        if sibling is heading:
-            continue
-        if getattr(sibling, "name", None) in ("h1", "h2", "h3", "h4"):
-            title = norm(sibling.get_text(" ", strip=True)).lower()
-            if any(x in title for x in ("current stock", "current mirage stock", "last stock", "last mirage", "history", "reset times")):
+
+    found = []
+    seen = set()
+    # Walk following nodes until a sibling stock/history heading appears.
+    for node in heading.next_elements:
+        if getattr(node, "name", None) in ("h1", "h2", "h3", "h4"):
+            title = norm(node.get_text(" ", strip=True)).lower()
+            if any(token in title for token in (
+                "current stock", "current mirage stock", "last stock",
+                "last mirage", "history", "reset times",
+            )):
                 break
-        if getattr(sibling, "name", None) in ("a", "strong", "b", "li", "article", "img"):
-            text = sibling.get("alt", "") if sibling.name == "img" else sibling.get_text(" ", strip=True)
-            fruit = fruit_match(text)
-            if fruit and fruit not in candidates:
-                candidates.append(fruit)
-    if not candidates:
+        name = None
+        if getattr(node, "name", None) == "img":
+            name = fruit_in(node.get("alt", ""))
+        elif getattr(node, "name", None) in ("a", "li", "article", "strong", "b"):
+            name = fruit_in(node.get_text(" ", strip=True))
+        if name and name not in seen:
+            found.append(name)
+            seen.add(name)
+
+    if not found:
         parent = heading.find_parent("section") or heading.parent
-        for node in parent.find_all(["a", "strong", "b", "li", "article", "img"]):
+        for node in parent.find_all(["img", "a", "li", "article", "strong", "b"]):
             text = node.get("alt", "") if node.name == "img" else node.get_text(" ", strip=True)
-            fruit = fruit_match(text)
-            if fruit and fruit not in candidates:
-                candidates.append(fruit)
-    return candidates
+            name = fruit_in(text)
+            if name and name not in seen:
+                found.append(name)
+                seen.add(name)
+    return found
+
 
 def fetch_stock():
     errors = []
     for url in STOCK_URLS:
         try:
             soup = get_soup(url)
-            normal = section_fruits(soup, [r"^current stock$", r"^normal stock$", r"^current normal stock$"])
-            mirage = section_fruits(soup, [r"^current mirage stock$", r"^mirage stock$", r"^advanced stock$"])
+            normal = parse_stock_section(soup, [
+                r"current stock", r"normal stock", r"current normal stock",
+            ])
+            mirage = parse_stock_section(soup, [
+                r"current mirage stock", r"mirage stock", r"advanced stock",
+            ])
             result = {}
-            if normal: result["استاک معمولی"] = normal
-            if mirage: result["استاک میراژ"] = mirage
+            if normal:
+                result["استاک معمولی"] = normal
+            if mirage:
+                result["استاک میراژ"] = mirage
             if result:
-                log.info("Stock parsed from %s: %s", url, {k: len(v) for k, v in result.items()})
+                log.info("Stock fetched from %s: %s", url, {k: len(v) for k, v in result.items()})
                 return result
-            errors.append(f"{url}: stock headings/cards not recognized")
+            errors.append(f"{url}: ساختار استاک پیدا نشد")
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
             log.warning("Stock source failed (%s): %s", url, exc)
-    raise RuntimeError("تمام منابع استاک ناموفق بودند: " + " | ".join(errors))
+            errors.append(f"{url}: {exc}")
+    raise RuntimeError("منابع استاک ناموفق بودند: " + " | ".join(errors))
 
-def value_number(value):
-    m = re.search(r"([\\d,.]+)\\s*([KMBT]?)", str(value), re.I)
-    if not m: return 0
-    try: n = float(m.group(1).replace(",", ""))
-    except ValueError: return 0
-    return n * {"": 1, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(m.group(2).upper(), 1)
+
+def parse_number(text):
+    """Convert 5K/2.5M/1.2B or full comma-separated values to a number."""
+    match = re.search(r"(?<![A-Za-z])(\d[\d,.]*)(?:\s*([KMBT]))?(?![A-Za-z])", str(text), re.I)
+    if not match:
+        return None
+    try:
+        number = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    suffix = (match.group(2) or "").upper()
+    return number * {"": 1, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[suffix]
+
+
+def display_number(number):
+    if number >= 1e12:
+        return f"{number / 1e12:g}T"
+    if number >= 1e9:
+        return f"{number / 1e9:g}B"
+    if number >= 1e6:
+        return f"{number / 1e6:g}M"
+    if number >= 1e3:
+        return f"{number / 1e3:g}K"
+    return f"{number:g}"
+
 
 def fetch_values():
     errors = []
@@ -131,157 +255,307 @@ def fetch_values():
         try:
             soup = get_soup(url)
             values = {}
-            for node in soup.find_all(["article", "tr", "li"]):
+
+            # A fruit card/row should contain a recognizable fruit and at least one value.
+            # Prefer the page's "trade value" label when present, avoiding Beli/Robux prices.
+            for node in soup.find_all(["article", "tr", "li", "section"]):
                 text = norm(node.get_text(" ", strip=True))
-                if not text or len(text) > 350: continue
-                matches = list(re.finditer(r"([\\d,.]+\\s*[KMBT])\\b", text, re.I))
-                if not matches: continue
-                # Usually the trade value is the first compact K/M/B value in a card.
-                raw = matches[0].group(1).replace(" ", "").upper()
-                name = ""
-                for tag in node.find_all(["h2", "h3", "h4", "strong", "a", "td"], limit=8):
-                    candidate = norm(tag.get_text(" ", strip=True))
-                    if candidate and len(candidate) <= 60 and not re.search(r"\\b(value|demand|regular|permanent|beli|robux|price)\\b", candidate, re.I) and not re.fullmatch(r"[\\d,.]+\\s*[KMBT]?", candidate, re.I):
-                        name = candidate
+                if not text or len(text) > 1200:
+                    continue
+                fruit = fruit_in(text[:250])
+                if not fruit:
+                    # Try headings and image alt labels inside the card.
+                    for tag in node.find_all(["h1", "h2", "h3", "h4", "img", "a"], limit=8):
+                        candidate = tag.get("alt", "") if tag.name == "img" else tag.get_text(" ", strip=True)
+                        fruit = fruit_in(candidate)
+                        if fruit:
+                            break
+                if not fruit:
+                    continue
+
+                # Extract a value close to trade/value label. If the page's accessible text
+                # is structured differently, fall back to the first large number.
+                value_text = ""
+                patterns = [
+                    r"(?:regular\s+trade\s+value|trade\s+value|physical\s+value|value)\s*[:\-]?\s*([\d,.]+\s*[KMBT]?)",
+                    r"([\d,.]+\s*[KMBT])",
+                    r"\b(\d{1,3}(?:,\d{3}){1,4})\b",
+                ]
+                # Try smaller descendant blocks first so unrelated card values aren't mixed.
+                descendants = [node] + node.find_all(["p", "div", "span", "strong", "b", "h3", "h4"], limit=80)
+                for part in descendants:
+                    part_text = norm(part.get_text(" ", strip=True))
+                    if not part_text:
+                        continue
+                    label_match = re.search(patterns[0], part_text, re.I)
+                    if label_match:
+                        value_text = label_match.group(1)
                         break
-                if not name:
-                    name = fruit_match(text) or ""
-                if name: values[name] = raw
-            if values:
-                log.info("Parsed %s value rows from %s", len(values), url)
-                return dict(sorted(values.items(), key=lambda kv: value_number(kv[1]), reverse=True))
-            errors.append(f"{url}: no values parsed")
+                if not value_text:
+                    for pattern in patterns[1:]:
+                        match = re.search(pattern, text, re.I)
+                        if match:
+                            value_text = match.group(1)
+                            break
+                number = parse_number(value_text) if value_text else None
+                if number is None or number <= 0:
+                    continue
+                # Keep the first valid card entry, unless a more precise later row appears.
+                values.setdefault(fruit, display_number(number))
+
+            if len(values) >= 5:
+                log.info("Extracted %d value rows from %s", len(values), url)
+                return dict(sorted(values.items(), key=lambda item: parse_number(item[1]) or 0, reverse=True))
+            errors.append(f"{url}: فقط {len(values)} مورد قابل تشخیص بود")
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
             log.warning("Value source failed (%s): %s", url, exc)
-    raise RuntimeError("تمام منابع ولیو ناموفق بودند: " + " | ".join(errors))
+            errors.append(f"{url}: {exc}")
+    raise RuntimeError("منابع ولیو ناموفق بودند: " + " | ".join(errors))
+
 
 def values_text(values, limit=70):
-    return "\\n".join(f"• {html.escape(str(k))} — <b>{html.escape(str(v))}</b>" for k, v in list(values.items())[:limit])
+    return "\n".join(
+        f"• {html.escape(str(name))} — <b>{html.escape(str(value))}</b>"
+        for name, value in list(values.items())[:limit]
+    )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user:
-        user_record(user); save_db()
-    name = html.escape(user.first_name if user else "")
-    await update.effective_message.reply_text(f"سلام {name}!\\nبه بات فارسی استاک و ولیو خوش آمدی.\\nبرای ثبت شماره، دکمه «📱 ارسال شماره» را بزن.", reply_markup=home_keyboard())
+    if not user:
+        return
+    rec = user_record(user)
+    save_db()
+    if rec.get("phone") and rec.get("phone_verified"):
+        text = f"سلام {html.escape(user.first_name or '')}!\nخوش برگشتی 🌟\nشماره‌ات قبلاً ثبت شده و نیازی به تأیید دوباره نیست."
+        keyboard = home_keyboard(phone_saved=True)
+    else:
+        text = f"سلام {html.escape(user.first_name or '')}!\nبه بات فارسی استاک و ولیو خوش اومدی.\nبرای ثبت شماره، دکمه «📱 ثبت شماره» را بزن؛ فقط یک بار لازم است."
+        keyboard = home_keyboard(phone_saved=False)
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("راهنما:\\n📦 استاک فعلی\\n💎 ولیوها\\n🔔 روشن/خاموش کردن اعلان‌ها\\n📱 ارسال شماره خودت از طریق تلگرام\\nادمین: /members و /status")
+    await update.effective_message.reply_text(
+        "راهنما:\n📦 استاک فعلی: نمایش استاک معمولی و میراژ\n"
+        "💎 ولیوها: نمایش مقادیر میوه‌ها\n🔔 اعلان‌ها: روشن/خاموش کردن اعلان‌ها\n"
+        "📱 ثبت شماره: فقط شمارهٔ خودت را با دکمهٔ رسمی تلگرام ارسال کن.\n"
+        "دستورهای ادمین: /members و /status"
+    )
+
 
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg, sender = update.effective_message, update.effective_user
-    contact = msg.contact if msg else None
-    if not sender or not contact: return
+    message = update.effective_message
+    sender = update.effective_user
+    contact = message.contact if message else None
+    if not sender or not contact:
+        return
     if contact.user_id != sender.id:
-        await msg.reply_text("لطفاً شمارهٔ خودت را با دکمهٔ تلگرام ارسال کن."); return
+        await message.reply_text("لطفاً شمارهٔ خودت را با دکمهٔ «ثبت شماره» ارسال کن.")
+        return
+
     rec = user_record(sender)
-    rec.update({"phone": contact.phone_number, "phone_verified": True, "phone_updated_at": now_text()})
+    # Idempotent: if the same contact is already saved, don't repeat admin notification.
+    already_saved = bool(rec.get("phone") and rec.get("phone_verified"))
+    same_phone = rec.get("phone") == contact.phone_number
+    if already_saved and same_phone:
+        save_db()
+        await message.reply_text("✅ شماره‌ات قبلاً ثبت شده؛ نیازی به تأیید دوباره نیست.", reply_markup=home_keyboard(phone_saved=True))
+        return
+
+    rec.update({
+        "phone": contact.phone_number,
+        "phone_verified": True,
+        "phone_updated_at": now_text(),
+    })
     save_db()
-    await msg.reply_text("✅ شماره از طریق تلگرام ثبت شد.", reply_markup=home_keyboard())
-    note = ("📱 <b>شماره کاربر ثبت شد</b>\\n"
-            f"نام: {html.escape(sender.full_name or '-')}\\n"
-            f"نام کاربری: @{html.escape(sender.username) if sender.username else 'ندارد'}\\n"
-            f"آیدی عددی: <code>{sender.id}</code>\\nشماره: <code>{html.escape(contact.phone_number)}</code>\\nزمان: {now_text()}\\n"
-            "<i>این تأیید پیامکی نیست؛ کاربر contact خودش را از تلگرام ارسال کرده است.</i>")
-    for aid in ADMIN_IDS:
-        try: await context.bot.send_message(aid, note, parse_mode="HTML")
-        except Exception: log.exception("Failed to notify admin %s", aid)
+    await message.reply_text("✅ شماره ثبت شد؛ از این به بعد لازم نیست دوباره بفرستی.", reply_markup=home_keyboard(phone_saved=True))
+
+    admin_text = (
+        "📱 <b>شماره کاربر ثبت شد</b>\n"
+        f"نام: {html.escape(sender.full_name or '-')}\n"
+        f"نام کاربری: @{html.escape(sender.username) if sender.username else 'ندارد'}\n"
+        f"آیدی عددی: <code>{sender.id}</code>\n"
+        f"شماره: <code>{html.escape(contact.phone_number)}</code>\n"
+        f"زمان: {now_text()}\n"
+        "<i>این یعنی کاربر contact خودش را از تلگرام فرستاده؛ تأیید پیامکی نیست.</i>"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, admin_text, parse_mode="HTML")
+        except Exception:
+            log.exception("Could not notify admin %s", admin_id)
+
 
 async def send_stock(update, context):
     try:
         stock = await asyncio.to_thread(fetch_stock)
-        body = "\\n\\n".join(f"<b>{html.escape(k)}</b>\\n" + "\\n".join("• " + html.escape(x) for x in v) for k, v in stock.items())
-        await update.effective_message.reply_text("📦 <b>استاک فعلی</b>\\n\\n" + body, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as exc:
-        log.warning("Stock fetch failed: %s", exc)
-        await update.effective_message.reply_text("فعلاً دریافت استاک ممکن نشد؛ کمی بعد دوباره امتحان کن.")
+        sections = [
+            f"<b>{html.escape(title)}</b>\n" + "\n".join("• " + html.escape(name) for name in fruits)
+            for title, fruits in stock.items()
+        ]
+        await update.effective_message.reply_text(
+            "📦 <b>استاک فعلی</b>\n\n" + "\n\n".join(sections),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("Stock request failed")
+        await update.effective_message.reply_text(
+            "⚠️ منبع استاک فعلاً پاسخ درست نداد. خطای دقیق در لاگ هاست ثبت شده؛ کمی بعد دوباره امتحان کن."
+        )
+
 
 async def send_values(update, context):
     try:
-        vals = await asyncio.to_thread(fetch_values)
-        await update.effective_message.reply_text("💎 <b>ولیوها (از بیشترین به کمترین)</b>\\n\\n" + values_text(vals), parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as exc:
-        log.warning("Value fetch failed: %s", exc)
-        await update.effective_message.reply_text("فعلاً دریافت ولیوها ممکن نشد؛ منبع ممکن است تغییر کرده یا دسترسی بات را بسته باشد.")
+        values = await asyncio.to_thread(fetch_values)
+        await update.effective_message.reply_text(
+            "💎 <b>ولیوها (از بیشترین به کمترین)</b>\n\n" + values_text(values),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("Values request failed")
+        await update.effective_message.reply_text(
+            "⚠️ منبع ولیو فعلاً پاسخ قابل‌خواندن نداد. خطای دقیق در لاگ هاست ثبت شده؛ کمی بعد دوباره امتحان کن."
+        )
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg, user = update.effective_message, update.effective_user
-    if not msg or not user or not msg.text: return
-    rec = user_record(user); save_db()
-    if msg.text == "📦 استاک فعلی": await send_stock(update, context)
-    elif msg.text == "💎 ولیوها": await send_values(update, context)
-    elif msg.text == "🔔 اعلان‌ها":
-        rec["alerts"] = not rec.get("alerts", True); save_db()
-        await msg.reply_text("اعلان‌ها " + ("روشن شد." if rec["alerts"] else "خاموش شد."))
-    elif msg.text == "ℹ️ راهنما": await help_cmd(update, context)
+    message, user = update.effective_message, update.effective_user
+    if not message or not user or not message.text:
+        return
+    rec = user_record(user)
+    save_db()
+    if message.text == "📦 استاک فعلی":
+        await send_stock(update, context)
+    elif message.text == "💎 ولیوها":
+        await send_values(update, context)
+    elif message.text == "🔔 اعلان‌ها":
+        rec["alerts"] = not rec.get("alerts", True)
+        save_db()
+        await message.reply_text("اعلان‌ها " + ("روشن شد." if rec["alerts"] else "خاموش شد."))
+    elif message.text == "ℹ️ راهنما":
+        await help_cmd(update, context)
+
 
 def make_members_html():
-    users = sorted(DB.get("users", {}).values(), key=lambda u: int(u.get("id", 0)))
+    users = sorted(DB.get("users", {}).values(), key=lambda item: int(item.get("id", 0)))
     rows = []
-    for i, u in enumerate(users, 1):
-        username = "@" + u.get("username", "") if u.get("username") else "ندارد"
-        cells = [i, u.get("first_name", ""), username, u.get("id", ""), u.get("phone") or "ندارد",
-                 "ثبت‌شده از تلگرام" if u.get("phone_verified") else "ثبت نشده", u.get("created_at", "")]
-        rows.append("<tr>" + "".join("<td>" + html.escape(str(c)) + "</td>" for c in cells) + "</tr>")
-    table = "\\n".join(rows) or '<tr><td colspan="7">هنوز کاربری ثبت نشده است.</td></tr>'
-    return f'''<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>اعضای BloxPulse</title>
-<style>body{{font-family:Tahoma,Arial;background:#0e1420;color:#edf2f7;margin:0;padding:24px}}.wrap{{max-width:1200px;margin:auto}}h1{{font-size:25px}}.count{{background:#192538;padding:16px;border-radius:12px;margin:16px 0}}.tablewrap{{overflow:auto;background:#141e2d;border-radius:12px}}table{{border-collapse:collapse;width:100%;min-width:850px}}th,td{{padding:12px;border-bottom:1px solid #2b394c;text-align:right;white-space:nowrap}}th{{background:#20324a}}tr:hover{{background:#1b2a3d}}input{{padding:10px;border-radius:8px;border:1px solid #394b62;background:#111b29;color:white;width:min(360px,90%)}}small{{color:#aab7c8}}</style></head><body><div class="wrap"><h1>اعضای BloxPulse فارسی</h1><div class="count">تعداد کل کاربران: <b>{len(users)}</b></div><input id="q" placeholder="جستجو در نام، آیدی، شماره..." oninput="filterRows()"><p><small>این فایل شامل اطلاعات خصوصی کاربران است؛ آن را عمومی منتشر نکنید.</small></p><div class="tablewrap"><table><thead><tr><th>ردیف</th><th>نام</th><th>نام کاربری</th><th>آیدی عددی</th><th>شماره تلفن</th><th>وضعیت شماره</th><th>تاریخ ثبت</th></tr></thead><tbody id="rows">{table}</tbody></table></div></div><script>function filterRows(){{let q=document.getElementById('q').value.toLowerCase();document.querySelectorAll('#rows tr').forEach(r=>r.style.display=r.innerText.toLowerCase().includes(q)?'':'none')}}</script></body></html>'''
+    for index, user in enumerate(users, 1):
+        username = "@" + user.get("username", "") if user.get("username") else "ندارد"
+        cells = [
+            index, user.get("first_name", ""), username, user.get("id", ""),
+            user.get("phone") or "ندارد",
+            "ثبت‌شده از تلگرام" if user.get("phone_verified") else "ثبت نشده",
+            user.get("created_at", ""),
+        ]
+        rows.append("<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in cells) + "</tr>")
+    body = "\n".join(rows) or '<tr><td colspan="7">هنوز کاربری ثبت نشده است.</td></tr>'
+    return f"""<!doctype html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>اعضای BloxPulse</title><style>
+body{{font-family:Tahoma,Arial;background:#0e1420;color:#edf2f7;margin:0;padding:24px}}
+.wrap{{max-width:1200px;margin:auto}}.count{{background:#192538;padding:16px;border-radius:12px;margin:16px 0}}
+.tablewrap{{overflow:auto;background:#141e2d;border-radius:12px}}table{{border-collapse:collapse;width:100%;min-width:850px}}
+th,td{{padding:12px;border-bottom:1px solid #2b394c;text-align:right;white-space:nowrap}}th{{background:#20324a}}
+input{{padding:10px;border-radius:8px;border:1px solid #394b62;background:#111b29;color:white;width:min(360px,90%)}}
+small{{color:#aab7c8}}</style></head><body><div class="wrap"><h1>اعضای BloxPulse فارسی</h1>
+<div class="count">تعداد کل کاربران: <b>{len(users)}</b></div>
+<input id="q" placeholder="جستجو در نام، آیدی، شماره..." oninput="filterRows()">
+<p><small>این فایل حاوی اطلاعات خصوصی است؛ عمومی منتشرش نکن.</small></p>
+<div class="tablewrap"><table><thead><tr><th>ردیف</th><th>نام</th><th>نام کاربری</th><th>آیدی</th><th>شماره</th><th>وضعیت شماره</th><th>تاریخ ثبت</th></tr></thead>
+<tbody id="rows">{body}</tbody></table></div></div>
+<script>function filterRows(){{const q=document.getElementById('q').value.toLowerCase();document.querySelectorAll('#rows tr').forEach(r=>r.style.display=r.innerText.toLowerCase().includes(q)?'':'none')}}</script>
+</body></html>"""
+
 
 async def members_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("⛔ این دستور فقط برای ادمین است."); return
+        await update.effective_message.reply_text("⛔ این دستور فقط برای ادمین است.")
+        return
     path = Path("members.html")
     path.write_text(make_members_html(), encoding="utf-8")
-    with path.open("rb") as f:
-        await update.effective_message.reply_document(document=f, filename="members.html", caption=f"📋 فهرست اعضا — تعداد کل: {len(DB.get('users', {}))}\\nاین فایل را عمومی منتشر نکن.")
+    with path.open("rb") as file_obj:
+        await update.effective_message.reply_document(
+            document=file_obj,
+            filename="members.html",
+            caption=f"فهرست اعضا — تعداد کل: {len(DB.get('users', {}))}\nاین فایل را عمومی نکن.",
+        )
+
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("⛔ این دستور فقط برای ادمین است."); return
-    await update.effective_message.reply_text(f"🟢 بات فعال است.\\nکاربران: {len(DB.get('users', {}))}\\nگروه‌ها: {len(DB.get('chats', {}))}\\nفاصله بررسی: {CHECK_INTERVAL} ثانیه")
+        await update.effective_message.reply_text("⛔ این دستور فقط برای ادمین است.")
+        return
+    await update.effective_message.reply_text(
+        f"🟢 بات فعال است.\nکاربران: {len(DB.get('users', {}))}\n"
+        f"گروه‌ها: {len(DB.get('chats', {}))}\nفاصله بررسی: {CHECK_INTERVAL} ثانیه"
+    )
+
 
 async def announce_changes(app, key, new_data, formatter):
-    old = DB.get(key, {})
-    if old and old != new_data:
-        message = formatter(new_data)
-        for uid, rec in list(DB.get("users", {}).items()):
-            if rec.get("alerts", True):
-                try: await app.bot.send_message(int(uid), message, parse_mode="HTML")
-                except Exception as exc: log.debug("Notify user %s failed: %s", uid, exc)
-        for cid in list(DB.get("chats", {})):
-            try: await app.bot.send_message(int(cid), message, parse_mode="HTML")
-            except Exception as exc: log.debug("Notify chat %s failed: %s", cid, exc)
+    old_data = DB.get(key, {})
+    # First successful poll stores baseline; don't spam users at first startup.
+    if old_data and old_data != new_data:
+        text = formatter(new_data)
+        for user_id, record in list(DB.get("users", {}).items()):
+            if record.get("alerts", True):
+                try:
+                    await app.bot.send_message(int(user_id), text, parse_mode="HTML")
+                except Exception as exc:
+                    log.debug("Could not notify user %s: %s", user_id, exc)
+        for chat_id in list(DB.get("chats", {})):
+            try:
+                await app.bot.send_message(int(chat_id), text, parse_mode="HTML")
+            except Exception as exc:
+                log.debug("Could not notify chat %s: %s", chat_id, exc)
     DB[key] = new_data
     save_db()
+
 
 async def periodic_checks(app):
     await asyncio.sleep(10)
     while True:
         try:
             data = await asyncio.to_thread(fetch_stock)
-            await announce_changes(app, "stock", data, lambda d: "📦 <b>تغییر استاک</b>\\n\\n" + "\\n\\n".join("<b>"+html.escape(k)+"</b>\\n"+"\\n".join("• "+html.escape(x) for x in v) for k,v in d.items()))
-        except asyncio.CancelledError: raise
-        except Exception: log.exception("Stock check failed")
+            await announce_changes(
+                app, "stock", data,
+                lambda d: "📦 <b>تغییر استاک</b>\n\n" + "\n\n".join(
+                    f"<b>{html.escape(k)}</b>\n" + "\n".join("• " + html.escape(v) for v in vals)
+                    for k, vals in d.items()
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Periodic stock check failed")
         try:
             data = await asyncio.to_thread(fetch_values)
-            await announce_changes(app, "values", data, lambda d: "💎 <b>تغییر ولیوها</b>\\n\\n" + values_text(d))
-        except asyncio.CancelledError: raise
-        except Exception: log.exception("Value check failed")
+            await announce_changes(app, "values", data, lambda d: "💎 <b>تغییر ولیوها</b>\n\n" + values_text(d))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Periodic value check failed")
         await asyncio.sleep(CHECK_INTERVAL)
+
 
 async def post_init(app):
     load_db()
     app.bot_data["periodic_task"] = asyncio.create_task(periodic_checks(app))
 
+
 async def post_shutdown(app):
     task = app.bot_data.get("periodic_task")
     if task:
         task.cancel()
-        try: await task
-        except asyncio.CancelledError: pass
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
 
 async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -289,11 +563,15 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
         DB.setdefault("chats", {})[str(chat.id)] = {"title": chat.title or "", "type": chat.type}
         save_db()
 
+
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("متغیر BOT_TOKEN در Environment Variables هاست تنظیم نشده است.")
+        raise RuntimeError("BOT_TOKEN در Environment Variables هاست تنظیم نشده است.")
     load_db()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = (
+        Application.builder().token(BOT_TOKEN)
+        .post_init(post_init).post_shutdown(post_shutdown).build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("members", members_cmd))
@@ -302,6 +580,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(ChatMemberHandler(chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
