@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-BloxPulse / BloxFa — Telegram bot for Blox Fruits Stock & Values
-Fixed: uses official tRPC API of bloxfruitsvalues.com (stock.get)
-Compatible with Python 3.11 / 3.12 and python-telegram-bot 21.x
+BloxPulse — Telegram bot for Blox Fruits Stock & Values
+Uses bloxfruitsvalues.com tRPC API + full catalog (~92 items)
+Mini App: http://scriptx.ir/BloxTrading/
+Python 3.11 / 3.12 · python-telegram-bot 21.x
 """
 
 import os
@@ -16,7 +17,14 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    WebAppInfo,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -37,8 +45,11 @@ ADMIN_IDS = {
 VALUES_URL = os.getenv("VALUE_URL", "https://bloxfruitsvalues.com/values").strip()
 STOCK_URL = os.getenv("STOCK_URL", "https://bloxfruitsvalues.com/stock").strip()
 API_BASE = "https://bloxfruitsvalues.com/api/ws"
+# Mini App / Web site
+MINI_APP_URL = os.getenv("MINI_APP_URL", "http://scriptx.ir/BloxTrading/").strip()
 DB_PATH = Path(os.getenv("DB_PATH", "data.json"))
 CHECK_INTERVAL = max(900, int(os.getenv("CHECK_INTERVAL_SECONDS", "3600")))
+SEED_PATH = Path(__file__).with_name("values_seed.json")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -46,14 +57,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("bloxpulse")
 
-# Session with browser-like headers (required by the site)
 S = requests.Session()
 S.headers.update(
     {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json",
         "trpc-accept": "application/json",
@@ -66,7 +75,6 @@ S.headers.update(
 DB: dict[str, Any] = {"users": {}, "chats": {}, "values": {}, "stock": {}, "meta": {}}
 IMAGES: dict[str, str] = {}
 
-# Canonical fruit list (used for name normalisation)
 FRUITS = [
     "Rocket", "Spin", "Blade", "Chop", "Spring", "Bomb", "Smoke", "Spike",
     "Flame", "Falcon", "Eagle", "Ice", "Sand", "Dark", "Diamond", "Light",
@@ -77,15 +85,17 @@ FRUITS = [
     "Leopard", "Tiger", "Kitsune", "Yeti", "Gas", "Magnet",
 ]
 LOOKUP = {x.lower(): x for x in FRUITS}
-LOOKUP["trex"] = "T-Rex"
-LOOKUP["t-rex"] = "T-Rex"
-LOOKUP["west dragon"] = "West Dragon"
-LOOKUP["east dragon"] = "East Dragon"
+LOOKUP.update({"trex": "T-Rex", "t-rex": "T-Rex", "west dragon": "West Dragon", "east dragon": "East Dragon"})
+
+# Base values from seed (physical trade value)
+BASE_VALUES: dict[str, float] = {}
+try:
+    if SEED_PATH.is_file():
+        BASE_VALUES = {k: float(v) for k, v in json.loads(SEED_PATH.read_text(encoding="utf-8")).items()}
+except Exception:
+    log.warning("Could not load values_seed.json")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -101,7 +111,7 @@ def load_db() -> None:
     except FileNotFoundError:
         pass
     except Exception:
-        log.exception("Could not read data.json; keeping in-memory data")
+        log.exception("Could not read data.json")
 
 
 def save_db() -> None:
@@ -132,9 +142,7 @@ def parse_num(s: Any) -> float | None:
     if not m:
         return None
     n = float(m.group(1))
-    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(
-        (m.group(2) or "").upper(), 1
-    )
+    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get((m.group(2) or "").upper(), 1)
     return n * mult
 
 
@@ -144,19 +152,16 @@ def fmt_num(n: float | int | None) -> str:
     n = float(n)
     for unit, scale in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
         if n >= scale:
-            return f"{n / scale:g}{unit}"
+            v = n / scale
+            return f"{v:g}{unit}" if v >= 10 or v == int(v) else f"{v:.1f}{unit}".replace(".0", "")
     return f"{n:g}"
 
 
 def trpc_get(procedure: str, input_payload: dict | None = None) -> Any:
-    """Call a tRPC procedure on bloxfruitsvalues.com."""
     if input_payload is None:
         input_payload = {"0": {"json": None}}
     url = f"{API_BASE}/{procedure}"
-    params = {
-        "batch": "1",
-        "input": json.dumps(input_payload, separators=(",", ":")),
-    }
+    params = {"batch": "1", "input": json.dumps(input_payload, separators=(",", ":"))}
     r = S.get(url, params=params, timeout=25)
     r.raise_for_status()
     data = r.json()
@@ -170,13 +175,9 @@ def trpc_get(procedure: str, input_payload: dict | None = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Data fetchers
+# Fetchers
 # ---------------------------------------------------------------------------
 def fetch_stock() -> dict[str, list[dict]]:
-    """
-    Fetch live Normal + Mirage stock from the official API.
-    Returns: {"استاک معمولی": [...], "استاک میراژ": [...]}
-    """
     try:
         payload = trpc_get("stock.get")
     except Exception as e:
@@ -184,59 +185,48 @@ def fetch_stock() -> dict[str, list[dict]]:
         raise RuntimeError(f"Stock API failed: {e}") from e
 
     result: dict[str, list[dict]] = {}
-    mapping = (
-        ("normal", "استاک معمولی"),
-        ("mirage", "استاک میراژ"),
-    )
-
-    for key, title in mapping:
-        section = payload.get(key) or {}
-        fruits = section.get("fruits") or []
+    for key, title in (("normal", "استاک معمولی"), ("mirage", "استاک میراژ")):
+        fruits = (payload.get(key) or {}).get("fruits") or []
         items = []
         for f in fruits:
             name = fruit_name(f.get("name") or "") or f.get("name") or "Unknown"
             img = f.get("image") or ""
             if img:
                 IMAGES[name] = img
-            item = {
+            bp, rp = f.get("beliPrice"), f.get("robuxPrice")
+            items.append({
                 "name": name,
                 "image": img,
                 "rarity": f.get("rarity") or "",
                 "type": f.get("fruitType") or "",
-                "beli": f"{f.get('beliPrice'):,}" if f.get("beliPrice") is not None else "",
-                "robux": f"{f.get('robuxPrice'):,}" if f.get("robuxPrice") is not None else "",
+                "beli": f"{bp:,}" if bp is not None else "",
+                "robux": f"{rp:,}" if rp is not None else "",
                 "value": fmt_num(f.get("regularValue")),
                 "demand": f.get("regularDemand"),
-            }
-            items.append(item)
+            })
         if items:
             result[title] = items
 
     if not result:
         raise RuntimeError("No stock cards returned by API")
 
-    # Store meta for countdowns
     meta = {}
     for key in ("normal", "mirage"):
-        sec = payload.get(key) or {}
-        win = sec.get("window") or {}
+        win = (payload.get(key) or {}).get("window") or {}
         if win.get("resetsAt"):
             meta[f"{key}_resets_at"] = win["resetsAt"]
     DB["meta"].update(meta)
-    log.info(
-        "Stock API OK — normal=%d mirage=%d",
-        len(result.get("استاک معمولی", [])),
-        len(result.get("استاک میراژ", [])),
-    )
+    log.info("Stock OK — normal=%d mirage=%d", len(result.get("استاک معمولی", [])), len(result.get("استاک میراژ", [])))
     return result
 
 
 def fetch_values() -> dict[str, str]:
     """
-    Build a values dict from the stock API (which embeds current values)
-    plus any previously cached values. This avoids the broken HTML parser.
+    Full catalog: start from seed (~85+ items), override with live values from stock API.
+    Returns name -> formatted physical value string.
     """
-    values: dict[str, str] = {}
+    values: dict[str, float] = dict(BASE_VALUES)
+
     try:
         payload = trpc_get("stock.get")
         for section_key in ("normal", "mirage"):
@@ -246,72 +236,63 @@ def fetch_values() -> dict[str, str]:
                     continue
                 val = f.get("regularValue")
                 if val is not None and val > 0:
-                    values[name] = fmt_num(val)
-                img = f.get("image")
-                if img:
-                    IMAGES[name] = img
-        # Also pull from history if present
+                    values[name] = float(val)
+                if f.get("image"):
+                    IMAGES[name] = f["image"]
         for hist_list in (payload.get("history") or {}).values():
             if not isinstance(hist_list, list):
                 continue
             for entry in hist_list:
                 for f in entry.get("fruits") or []:
                     name = fruit_name(f.get("name") or "") or f.get("name")
-                    if name and name not in values and f.get("value"):
-                        values[name] = fmt_num(f["value"])
+                    if name and f.get("value") and name not in values:
+                        values[name] = float(f["value"])
                     if f.get("image"):
                         IMAGES[name] = f["image"]
     except Exception as e:
-        log.warning("Values from stock API failed: %s", e)
+        log.warning("Live value overlay failed: %s", e)
 
-    # Merge previously stored values so the list stays useful between stock rotations
-    old = DB.get("values") or {}
-    for k, v in old.items():
-        if k not in values:
-            values[k] = v
+    # Keep previously stored if still missing
+    for k, v in (DB.get("values") or {}).items():
+        n = parse_num(v)
+        if k not in values and n:
+            values[k] = n
 
-    if len(values) < 3:
-        raise RuntimeError(
-            f"Parsed only {len(values)} fruit values; API may be temporarily unavailable"
-        )
+    if len(values) < 5:
+        raise RuntimeError(f"Only {len(values)} values available")
 
-    log.info("Parsed %d values", len(values))
-    return dict(
-        sorted(values.items(), key=lambda x: parse_num(x[1]) or 0, reverse=True)
-    )
+    formatted = {k: fmt_num(v) for k, v in values.items()}
+    log.info("Values ready: %d items", len(formatted))
+    return dict(sorted(formatted.items(), key=lambda x: parse_num(x[1]) or 0, reverse=True))
 
 
 # ---------------------------------------------------------------------------
-# Telegram UI
+# UI
 # ---------------------------------------------------------------------------
 def keyboard(saved: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("📦 استاک فعلی"), KeyboardButton("💎 ولیوها")],
-        [KeyboardButton("🔔 اعلان‌ها"), KeyboardButton("ℹ️ راهنما")],
+        [KeyboardButton("🌐 سایت / مینی‌اپ"), KeyboardButton("🔔 اعلان‌ها")],
+        [KeyboardButton("ℹ️ راهنما")],
     ]
     if not saved:
         rows.insert(1, [KeyboardButton("📱 ثبت شماره", request_contact=True)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
+def mini_app_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 باز کردن BloxTrading", web_app=WebAppInfo(url=MINI_APP_URL))],
+        [InlineKeyboardButton("🔗 باز کردن در مرورگر", url=MINI_APP_URL)],
+    ])
+
+
 def rec_for(user) -> dict:
     rec = DB["users"].setdefault(
         str(user.id),
-        {
-            "id": user.id,
-            "phone": "",
-            "phone_verified": False,
-            "created_at": now(),
-            "alerts": True,
-        },
+        {"id": user.id, "phone": "", "phone_verified": False, "created_at": now(), "alerts": True},
     )
-    rec.update(
-        {
-            "id": user.id,
-            "username": user.username or "",
-            "first_name": user.first_name or "",
-        }
-    )
+    rec.update({"id": user.id, "username": user.username or "", "first_name": user.first_name or ""})
     rec.setdefault("phone", "")
     rec.setdefault("phone_verified", False)
     rec.setdefault("alerts", True)
@@ -326,17 +307,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     r = rec_for(u)
     save_db()
     saved = bool(r.get("phone") and r.get("phone_verified"))
-    if saved:
-        msg = (
-            f"سلام {html.escape(u.first_name or '')}!\n"
-            "خوش برگشتی 🌟\nشماره‌ات قبلاً ثبت شده."
-        )
-    else:
-        msg = (
-            f"سلام {html.escape(u.first_name or '')}!\n"
-            "برای ثبت شماره، دکمه «📱 ثبت شماره» را بزن؛ فقط یک بار لازم است."
-        )
+    msg = (
+        f"سلام {html.escape(u.first_name or '')}!\nخوش برگشتی 🌟\nشماره‌ات قبلاً ثبت شده."
+        if saved
+        else f"سلام {html.escape(u.first_name or '')}!\nبرای ثبت شماره دکمه «📱 ثبت شماره» را بزن."
+    )
     await update.effective_message.reply_text(msg, reply_markup=keyboard(saved))
+    await update.effective_message.reply_text(
+        "🌐 سایت و مینی‌اپ BloxTrading را از اینجا باز کن:",
+        reply_markup=mini_app_markup(),
+    )
 
 
 async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -350,67 +330,20 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
     r = rec_for(u)
     if r.get("phone_verified") and r.get("phone") == c.phone_number:
-        await m.reply_text(
-            "✅ شماره‌ات قبلاً ثبت شده.", reply_markup=keyboard(True)
-        )
+        await m.reply_text("✅ شماره‌ات قبلاً ثبت شده.", reply_markup=keyboard(True))
         return
-    r.update(
-        {
-            "phone": c.phone_number,
-            "phone_verified": True,
-            "phone_updated_at": now(),
-        }
-    )
+    r.update({"phone": c.phone_number, "phone_verified": True, "phone_updated_at": now()})
     save_db()
-    await m.reply_text(
-        "✅ شماره ثبت شد؛ لازم نیست دوباره بفرستی.",
-        reply_markup=keyboard(True),
-    )
+    await m.reply_text("✅ شماره ثبت شد.", reply_markup=keyboard(True))
     note = (
-        "📱 <b>شماره کاربر ثبت شد</b>\n"
-        f"نام: {html.escape(u.full_name or '-')}\n"
-        f"آیدی: <code>{u.id}</code>\n"
-        f"شماره: <code>{html.escape(c.phone_number)}</code>\n"
-        f"زمان: {now()}\n"
-        "<i>این تأیید پیامکی نیست؛ کاربر contact خودش را فرستاده.</i>"
+        f"📱 <b>شماره ثبت شد</b>\nنام: {html.escape(u.full_name or '-')}\n"
+        f"آیدی: <code>{u.id}</code>\nشماره: <code>{html.escape(c.phone_number)}</code>\nزمان: {now()}"
     )
     for aid in ADMIN_IDS:
         try:
             await ctx.bot.send_message(aid, note, parse_mode="HTML")
         except Exception:
-            log.exception("Admin notification failed")
-
-
-async def send_items(update, items: list[dict], title: str) -> None:
-    m = update.effective_message
-    await m.reply_text(title, parse_mode="HTML", disable_web_page_preview=True)
-    media = []
-    for it in items:
-        name = it["name"]
-        cap = f"🍈 <b>{html.escape(name)}</b>"
-        if it.get("rarity"):
-            cap += f"  ·  {html.escape(str(it['rarity']))}"
-        if it.get("value"):
-            cap += f"\n💎 ولیو: <b>{html.escape(str(it['value']))}</b>"
-        if it.get("beli"):
-            cap += f"\n💰 Beli: {html.escape(str(it['beli']))}"
-        if it.get("robux"):
-            cap += f"\n💎 Robux: {html.escape(str(it['robux']))}"
-        if it.get("demand") is not None:
-            cap += f"\n📈 Demand: {it['demand']}/10"
-        img = it.get("image") or IMAGES.get(name)
-        if img:
-            media.append(InputMediaPhoto(media=img, caption=cap, parse_mode="HTML"))
-        else:
-            await m.reply_text(cap, parse_mode="HTML")
-    for i in range(0, len(media), 10):
-        batch = media[i : i + 10]
-        if len(batch) == 1:
-            await m.reply_photo(
-                batch[0].media, caption=batch[0].caption, parse_mode="HTML"
-            )
-        elif batch:
-            await m.reply_media_group(batch)
+            log.exception("Admin notify failed")
 
 
 async def stock_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -425,47 +358,73 @@ async def stock_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
         await update.effective_message.reply_text(
-            f"📦 <b>استاک فعلی</b>\n"
-            f"منبع: <a href=\"{STOCK_URL}\">BloxFruitsValues</a>\n"
+            f"📦 <b>استاک فعلی</b>\nمنبع: <a href=\"{STOCK_URL}\">BloxFruitsValues</a>\n"
             f"آخرین دریافت: {now()}{extra}\n"
-            "ریست معمولی هر ۴ ساعت و میراژ هر ۲ ساعت (UTC).",
+            "ریست معمولی هر ۴ ساعت · میراژ هر ۲ ساعت (UTC).",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         for title, items in data.items():
-            await send_items(update, items, f"🍏 <b>{html.escape(title)}</b>")
+            lines = [f"🍏 <b>{html.escape(title)}</b>"]
+            for it in items:
+                line = f"• <b>{html.escape(it['name'])}</b>"
+                if it.get("rarity"):
+                    line += f" · {html.escape(it['rarity'])}"
+                if it.get("value"):
+                    line += f"\n  💎 {html.escape(str(it['value']))}"
+                if it.get("beli"):
+                    line += f" · 💰 {html.escape(str(it['beli']))}"
+                if it.get("robux"):
+                    line += f" · 💎R {html.escape(str(it['robux']))}"
+                lines.append(line)
+            await update.effective_message.reply_text(
+                "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+            )
         DB["stock"] = data
         save_db()
     except Exception:
         log.exception("Stock request failed")
         await update.effective_message.reply_text(
-            "⚠️ سایت استاک الان پاسخ قابل‌خواندن نداد؛ خطای دقیق در لاگ هاست ثبت شد."
+            "⚠️ دریافت استاک ناموفق بود. چند دقیقه بعد دوباره امتحان کن."
         )
 
 
 async def values_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         data = await asyncio.to_thread(fetch_values)
-        await update.effective_message.reply_text(
-            f"💎 <b>ولیوهای میوه‌ها</b>\n"
-            f"منبع: <a href=\"{VALUES_URL}\">BloxFruitsValues</a>\n"
-            f"دریافت: {now()}\n"
-            "این عددها ارزش معاملاتی‌اند، نه قیمت خرید Beli/Robux.",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        # Send as text chunks (Telegram limit ~4096)
+        header = (
+            f"💎 <b>ولیوهای کامل میوه‌ها</b>\n"
+            f"تعداد: {len(data)} آیتم\n"
+            f"زمان: {now()}\n"
+            f"منبع پایه + به‌روزرسانی زنده از استاک\n"
+            f"<i>ارزش معاملاتی فیزیکی (نه Beli/Robux)</i>\n\n"
         )
-        items = [
-            {"name": n, "value": v, "image": IMAGES.get(n, "")}
-            for n, v in data.items()
-        ]
-        # Limit to top 30 to avoid flooding
-        await send_items(update, items[:30], "🍈 <b>هر میوه با تصویر خودش</b>")
+        lines = [f"{i+1}. <b>{html.escape(n)}</b> — {html.escape(v)}" for i, (n, v) in enumerate(data.items())]
+        chunks: list[str] = []
+        current = header
+        for line in lines:
+            if len(current) + len(line) + 1 > 3800:
+                chunks.append(current)
+                current = line + "\n"
+            else:
+                current += line + "\n"
+        if current.strip():
+            chunks.append(current)
+
+        for i, chunk in enumerate(chunks):
+            await update.effective_message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=mini_app_markup() if i == len(chunks) - 1 else None,
+            )
         DB["values"] = data
         save_db()
     except Exception:
         log.exception("Value request failed")
         await update.effective_message.reply_text(
-            "⚠️ سایت ولیوها الان پاسخ قابل‌خواندن نداد؛ خطای دقیق در لاگ هاست ثبت شد."
+            "⚠️ دریافت ولیوها ناموفق بود. چند دقیقه بعد دوباره امتحان کن."
         )
 
 
@@ -476,20 +435,27 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     r = rec_for(u)
     save_db()
-    if m.text == "📦 استاک فعلی":
+    t = m.text
+    if t == "📦 استاک فعلی":
         await stock_cmd(update, ctx)
-    elif m.text == "💎 ولیوها":
+    elif t == "💎 ولیوها":
         await values_cmd(update, ctx)
-    elif m.text == "🔔 اعلان‌ها":
+    elif t == "🌐 سایت / مینی‌اپ":
+        await m.reply_text(
+            "سایت و مینی‌اپ BloxTrading:\n"
+            f"🔗 {MINI_APP_URL}\n\n"
+            "از دکمه زیر هم می‌تونی مستقیم باز کنی:",
+            reply_markup=mini_app_markup(),
+        )
+    elif t == "🔔 اعلان‌ها":
         r["alerts"] = not r.get("alerts", True)
         save_db()
+        await m.reply_text("اعلان‌ها " + ("روشن شد ✅" if r["alerts"] else "خاموش شد 🔕"))
+    elif t == "ℹ️ راهنما":
         await m.reply_text(
-            "اعلان‌ها " + ("روشن شد." if r["alerts"] else "خاموش شد.")
-        )
-    elif m.text == "ℹ️ راهنما":
-        await m.reply_text(
-            "📦 استاک فعلی: استاک معمولی و میراژ\n"
-            "💎 ولیوها: ارزش معاملاتی میوه‌ها\n"
+            "📦 استاک فعلی — استاک معمولی و میراژ (متن + زمان)\n"
+            "💎 ولیوها — لیست کامل ارزش معاملاتی (~۹۰ آیتم)\n"
+            "🌐 سایت / مینی‌اپ — باز کردن BloxTrading\n"
             "شماره فقط یک بار ثبت می‌شود.\n"
             "ادمین: /status"
         )
@@ -500,7 +466,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("⛔ فقط ادمین.")
         return
     await update.effective_message.reply_text(
-        f"🟢 فعال\nکاربران: {len(DB['users'])}\nآخرین زمان: {now()}"
+        f"🟢 فعال\nکاربران: {len(DB['users'])}\nولیوها: {len(DB.get('values') or {})}\nزمان: {now()}"
     )
 
 
@@ -511,22 +477,16 @@ async def chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         save_db()
 
 
-# ---------------------------------------------------------------------------
-# Periodic background task
-# ---------------------------------------------------------------------------
 async def periodic(app: Application) -> None:
     await asyncio.sleep(20)
     while True:
         try:
             vals = await asyncio.to_thread(fetch_values)
             if DB.get("values") and DB["values"] != vals:
-                for uid, r in DB["users"].items():
+                for uid, r in list(DB["users"].items()):
                     if r.get("alerts", True):
                         try:
-                            await app.bot.send_message(
-                                int(uid),
-                                "💎 ولیوها به‌روزرسانی شدند؛ برای دیدن فهرست /start را بزنید.",
-                            )
+                            await app.bot.send_message(int(uid), "💎 ولیوها به‌روزرسانی شدند.")
                         except Exception:
                             pass
             DB["values"] = vals
@@ -534,18 +494,15 @@ async def periodic(app: Application) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Periodic values check failed")
+            log.exception("Periodic values failed")
 
         try:
             stock = await asyncio.to_thread(fetch_stock)
             if DB.get("stock") and DB["stock"] != stock:
-                for uid, r in DB["users"].items():
+                for uid, r in list(DB["users"].items()):
                     if r.get("alerts", True):
                         try:
-                            await app.bot.send_message(
-                                int(uid),
-                                "📦 استاک تغییر کرده؛ «استاک فعلی» را بزنید.",
-                            )
+                            await app.bot.send_message(int(uid), "📦 استاک تغییر کرده.")
                         except Exception:
                             pass
             DB["stock"] = stock
@@ -553,7 +510,7 @@ async def periodic(app: Application) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Periodic stock check failed")
+            log.exception("Periodic stock failed")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -575,9 +532,7 @@ async def post_shutdown(app: Application) -> None:
 
 def main() -> None:
     if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is not configured. Set it in the host environment variables."
-        )
+        raise RuntimeError("BOT_TOKEN is not configured in environment")
     load_db()
     app = (
         Application.builder()
@@ -591,17 +546,15 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(
-        ChatMemberHandler(chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
-    )
+    app.add_handler(ChatMemberHandler(chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    log.info("Starting BloxPulse bot (single instance required)")
+    log.info("Starting BloxPulse (Mini App: %s)", MINI_APP_URL)
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except Conflict:
         log.error(
-            "Conflict: another getUpdates is running with the same token. "
-            "Stop the other instance (FadeHost or local Windows) and restart only one."
+            "Conflict: another getUpdates is running. "
+            "Stop the other instance and keep only one."
         )
         raise
 
