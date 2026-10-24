@@ -2,7 +2,7 @@
 """
 BloxPulse — Telegram bot for Blox Fruits Stock & Values
 Uses bloxfruitsvalues.com tRPC API + full catalog (~92 items)
-Mini App: http://scriptx.ir/BloxTrading/
+Mini App: https://scriptx.ir/BloxTrading/
 Python 3.11 / 3.12 · python-telegram-bot 21.x
 """
 
@@ -46,7 +46,7 @@ VALUES_URL = os.getenv("VALUE_URL", "https://bloxfruitsvalues.com/values").strip
 STOCK_URL = os.getenv("STOCK_URL", "https://bloxfruitsvalues.com/stock").strip()
 API_BASE = "https://bloxfruitsvalues.com/api/ws"
 # Mini App / Web site
-MINI_APP_URL = os.getenv("MINI_APP_URL", "http://scriptx.ir/BloxTrading/").strip()
+MINI_APP_URL = os.getenv("MINI_APP_URL", "https://scriptx.ir/BloxTrading/").strip()
 DB_PATH = Path(os.getenv("DB_PATH", "data.json"))
 CHECK_INTERVAL = max(900, int(os.getenv("CHECK_INTERVAL_SECONDS", "3600")))
 SEED_PATH = Path(__file__).with_name("values_seed.json")
@@ -280,11 +280,22 @@ def keyboard(saved: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-def mini_app_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 باز کردن BloxTrading", web_app=WebAppInfo(url=MINI_APP_URL))],
-        [InlineKeyboardButton("🔗 باز کردن در مرورگر", url=MINI_APP_URL)],
-    ])
+def mini_app_markup() -> InlineKeyboardMarkup | None:
+    """Telegram WebApp buttons require HTTPS. Fall back to normal URL button if not."""
+    url = (MINI_APP_URL or "").strip()
+    if not url:
+        return None
+    # Normalize accidental http -> https for known host (WebApp needs TLS)
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    rows = []
+    if url.startswith("https://"):
+        rows.append([InlineKeyboardButton("🚀 باز کردن مینی‌اپ", web_app=WebAppInfo(url=url))])
+        rows.append([InlineKeyboardButton("🔗 باز کردن در مرورگر", url=url)])
+    else:
+        # Non-https cannot be used as web_app; skip web_app to avoid BadRequest
+        rows.append([InlineKeyboardButton("🔗 باز کردن سایت", url=url)])
+    return InlineKeyboardMarkup(rows)
 
 
 def rec_for(user) -> dict:
